@@ -73,7 +73,7 @@ impl<D: Digest, E: PairingEngine> PolyCommitEquivalence<D, E, DensePolynomial<E:
             iter::once(polynomial),
             iter::once(commitments.1),
             &challenge_point,
-            E::Fr::rand(rng),
+            opening_challenge,
             iter::once(randomnesses.1),
             Some(rng),
         )?;
@@ -141,10 +141,61 @@ impl<D: Digest, E: PairingEngine> PolyCommitEquivalence<D, E, DensePolynomial<E:
 }
 
 #[cfg(test)]
+
 mod tests {
+    use ark_bn254::{Bn254, Fr};
+    use ark_ec::PairingEngine;
+    use ark_poly::{univariate::DensePolynomial, UVPolynomial};
+    use ark_poly_commit::{
+        ipa_pc::InnerProductArgPC, sonic_pc::SonicKZG10, LabeledPolynomial, PolynomialCommitment,
+    };
+    use blake2::Blake2s;
+    use rand::thread_rng;
+    use std::iter;
+
+    use crate::PolyCommitEquivalence;
+
+    type KZG = SonicKZG10<Bn254, DensePolynomial<Fr>>;
+    type IPA = InnerProductArgPC<<Bn254 as PairingEngine>::G1Affine, Blake2s, DensePolynomial<Fr>>;
+
     #[test]
-    fn it_works() {
-        let result = 2 + 2;
-        assert_eq!(result, 4);
+    fn ipa_kzg_equivalence() {
+        let rng = &mut thread_rng();
+        let max_degree = 20;
+        let max_hiding = 1;
+
+        // Random polynomial
+        let poly: DensePolynomial<Fr> = DensePolynomial::rand(max_degree - 1, rng);
+        let poly = LabeledPolynomial::new(String::from("poly"), poly, Some(max_degree), Some(1));
+
+        // Setup commitment schemes
+        let kzg_pp = KZG::setup(max_degree, None, rng).unwrap();
+        let (kzg_ck, kzg_vk) =
+            KZG::trim(&kzg_pp, max_degree, max_hiding, Some(&[max_degree])).unwrap();
+
+        let ipa_pp = IPA::setup(max_degree, None, rng).unwrap();
+        let (ipa_ck, ipa_vk) =
+            IPA::trim(&ipa_pp, max_degree, max_hiding, Some(&[max_degree])).unwrap();
+
+        // Commit to the polynomial with both schemes
+        let (kzg_commit, kzg_rand) = KZG::commit(&kzg_ck, iter::once(&poly), Some(rng)).unwrap();
+        let (ipa_commit, ipa_rand) = IPA::commit(&ipa_ck, iter::once(&poly), Some(rng)).unwrap();
+
+        // Proof of equivalence
+        let proof = PolyCommitEquivalence::<Blake2s, Bn254, DensePolynomial<Fr>>::prove(
+            (&kzg_ck, &ipa_ck),
+            &poly,
+            (&kzg_commit[0], &ipa_commit[0]),
+            (&kzg_rand[0], &ipa_rand[0]),
+        )
+        .unwrap();
+
+        // Verify proof
+        PolyCommitEquivalence::<Blake2s, Bn254, DensePolynomial<Fr>>::verify(
+            (&kzg_vk, &ipa_vk),
+            (&kzg_commit[0], &ipa_commit[0]),
+            proof,
+        )
+        .unwrap();
     }
 }
