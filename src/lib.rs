@@ -159,7 +159,7 @@ mod tests {
     type IPA = InnerProductArgPC<<Bn254 as PairingEngine>::G1Affine, Blake2s, DensePolynomial<Fr>>;
 
     #[test]
-    fn ipa_kzg_equivalence() {
+    fn ipa_kzg_equivalence_accept() {
         let rng = &mut thread_rng();
         let max_degree = 20;
         let max_hiding = 1;
@@ -197,5 +197,52 @@ mod tests {
             proof,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn ipa_kzg_equivalence_reject() {
+        let rng = &mut thread_rng();
+        let max_degree = 20;
+        let max_hiding = 1;
+
+        // Random polynomial
+        let poly: DensePolynomial<Fr> = DensePolynomial::rand(max_degree - 1, rng);
+        let poly = LabeledPolynomial::new(String::from("poly"), poly, Some(max_degree), Some(1));
+
+        let other_poly: DensePolynomial<Fr> = DensePolynomial::rand(max_degree - 1, rng);
+        let other_poly =
+            LabeledPolynomial::new(String::from("poly"), other_poly, Some(max_degree), Some(1));
+
+        // Setup commitment schemes
+        let kzg_pp = KZG::setup(max_degree, None, rng).unwrap();
+        let (kzg_ck, kzg_vk) =
+            KZG::trim(&kzg_pp, max_degree, max_hiding, Some(&[max_degree])).unwrap();
+
+        let ipa_pp = IPA::setup(max_degree, None, rng).unwrap();
+        let (ipa_ck, ipa_vk) =
+            IPA::trim(&ipa_pp, max_degree, max_hiding, Some(&[max_degree])).unwrap();
+
+        // Commit to different polynomials with both schemes
+        let (kzg_commit, kzg_rand) = KZG::commit(&kzg_ck, iter::once(&poly), Some(rng)).unwrap();
+        let (ipa_commit, ipa_rand) =
+            IPA::commit(&ipa_ck, iter::once(&other_poly), Some(rng)).unwrap();
+
+        // Proof of equivalence
+        let proof = PolyCommitEquivalence::<Blake2s, Bn254, DensePolynomial<Fr>>::prove(
+            (&kzg_ck, &ipa_ck),
+            &poly,
+            (&kzg_commit[0], &ipa_commit[0]),
+            (&kzg_rand[0], &ipa_rand[0]),
+        )
+        .unwrap();
+
+        // Verify proof
+        let check = PolyCommitEquivalence::<Blake2s, Bn254, DensePolynomial<Fr>>::verify(
+            (&kzg_vk, &ipa_vk),
+            (&kzg_commit[0], &ipa_commit[0]),
+            proof,
+        );
+
+        assert!(check.is_err());
     }
 }
