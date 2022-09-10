@@ -1,44 +1,141 @@
-use std::marker::PhantomData;
-
 use ark_ec::PairingEngine;
-use ark_ff::{Field, to_bytes};
+use ark_ff::to_bytes;
+use ark_marlin::rng::FiatShamirRng;
+use ark_poly::{univariate::DensePolynomial, Polynomial};
+use ark_poly_commit::{
+    ipa_pc::{self, InnerProductArgPC},
+    kzg10,
+    sonic_pc::{self, SonicKZG10},
+    LabeledCommitment, LabeledPolynomial, PolynomialCommitment,
+};
+use ark_std::{iter, marker::PhantomData, UniformRand};
+use digest::Digest;
+use rand::thread_rng;
 
 mod error;
-use ark_marlin::rng::FiatShamirRng;
-use ark_poly_commit::{
-    ipa_pc,
-    kzg10,
-    LabeledCommitment,
-};
-use digest::Digest;
 pub use error::Error;
 
-pub struct PolyCommitEquivalence<F: Field> {
-    _field: PhantomData<F>,
+pub struct PolyCommitEquivalence<D: Digest, E: PairingEngine, P: Polynomial<E::Fr>> {
+    _digest: PhantomData<D>,
+    _pairing: PhantomData<E>,
+    _poly: PhantomData<P>,
 }
 
-impl<F: Field> PolyCommitEquivalence<F> {
-    pub fn prove<D: Digest, E: PairingEngine>(
-        commitments: (
-            LabeledCommitment<kzg10::Commitment<E>>,
-            LabeledCommitment<ipa_pc::Commitment<E::G1Affine>>,
+pub struct Proof<E: PairingEngine> {
+    pub eval: E::Fr,
+    pub openings: (kzg10::Proof<E>, ipa_pc::Proof<E::G1Affine>),
+}
+
+impl<D: Digest, E: PairingEngine> PolyCommitEquivalence<D, E, DensePolynomial<E::Fr>> {
+    pub fn prove(
+        commit_keys: (
+            &sonic_pc::CommitterKey<E>,
+            &ipa_pc::CommitterKey<E::G1Affine>,
         ),
-    ) -> Result<(), Error> {
+        polynomial: &LabeledPolynomial<E::Fr, DensePolynomial<E::Fr>>,
+        commitments: (
+            &LabeledCommitment<sonic_pc::Commitment<E>>,
+            &LabeledCommitment<ipa_pc::Commitment<E::G1Affine>>,
+        ),
+        randomnesses: (
+            &sonic_pc::Randomness<E::Fr, DensePolynomial<E::Fr>>,
+            &ipa_pc::Randomness<E::G1Affine>,
+        ),
+    ) -> Result<Proof<E>, Error> {
+        let rng = &mut thread_rng();
+
         // Derive a challenge point
         let mut fs_rng = FiatShamirRng::<D>::from_seed(b"");
-        fs_rng.absorb(&to_bytes!(commitments.0.commitment(), commitments.1.commitment())?);
+        fs_rng.absorb(&to_bytes!(
+            commitments.0.commitment(),
+            commitments.1.commitment()
+        )?);
 
-        let challenge_point = F::rand(&mut fs_rng);
+        let challenge_point = E::Fr::rand(&mut fs_rng);
+        let opening_challenge = E::Fr::rand(&mut fs_rng);
+
+        // Compute the evaluation
+        let evaluation = polynomial.evaluate(&challenge_point);
 
         // Open both commitments at the challenge point
+        let kzg_opening = SonicKZG10::open(
+            commit_keys.0,
+            iter::once(polynomial),
+            iter::once(commitments.0),
+            &challenge_point,
+            opening_challenge,
+            iter::once(randomnesses.0),
+            Some(rng),
+        )?;
+
+        let ipa_opening = InnerProductArgPC::<E::G1Affine, D, DensePolynomial<E::Fr>>::open(
+            commit_keys.1,
+            iter::once(polynomial),
+            iter::once(commitments.1),
+            &challenge_point,
+            E::Fr::rand(rng),
+            iter::once(randomnesses.1),
+            Some(rng),
+        )?;
 
         // Return openings
-
-        Ok(())
+        let proof = Proof {
+            eval: evaluation,
+            openings: (kzg_opening, ipa_opening),
+        };
+        Ok(proof)
     }
 
-    pub fn verify() -> Result<(), Error> {
+    pub fn verify(
+        verifier_keys: (&sonic_pc::VerifierKey<E>, &ipa_pc::VerifierKey<E::G1Affine>),
+        commitments: (
+            &LabeledCommitment<sonic_pc::Commitment<E>>,
+            &LabeledCommitment<ipa_pc::Commitment<E::G1Affine>>,
+        ),
+        proof: Proof<E>,
+    ) -> Result<(), Error> {
+        let rng = &mut thread_rng();
+
+        // Derive a challenge point
+        let mut fs_rng = FiatShamirRng::<D>::from_seed(b"");
+        fs_rng.absorb(&to_bytes!(
+            commitments.0.commitment(),
+            commitments.1.commitment()
+        )?);
+        let challenge_point = E::Fr::rand(&mut fs_rng);
+        let opening_challenge = E::Fr::rand(&mut fs_rng);
+
         // Check both openings
+        let kzg_check = SonicKZG10::<E, DensePolynomial<E::Fr>>::check(
+            verifier_keys.0,
+            iter::once(commitments.0),
+            &challenge_point,
+            iter::once(proof.eval),
+            &proof.openings.0,
+            opening_challenge,
+            Some(rng),
+        );
+        match kzg_check {
+            Ok(true) => (),
+            Ok(false) => return Err(Error::KZGFailed),
+            Err(e) => return Err(Error::PolyCommitError(e)),
+        }
+
+        let ipa_check = InnerProductArgPC::<E::G1Affine, D, DensePolynomial<E::Fr>>::check(
+            verifier_keys.1,
+            iter::once(commitments.1),
+            &challenge_point,
+            iter::once(proof.eval),
+            &proof.openings.1,
+            opening_challenge,
+            Some(rng),
+        );
+        match ipa_check {
+            Ok(true) => (),
+            Ok(false) => return Err(Error::IPAFailed),
+            Err(e) => return Err(Error::PolyCommitError(e)),
+        }
+
         Ok(())
     }
 }
